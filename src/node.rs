@@ -4,10 +4,13 @@ use crate::node::prelude::*;
 
 mod prelude {
     pub use crate::{
+        bin_shared::{
+            linear_map, simfile_rng, symlink_dir, symlink_file, BaseDirFinder,
+        },
         node::{
             align::Align, filter::Filter, osuload::OsuLoad, pipe::Pipe, rate::Rate, rekey::Rekey,
             remap::Remap, select::Select, simfilewrite::SimfileWrite, simultaneous::Simultaneous,
-            space::Space, BucketId, BucketIter, BucketKind,
+            smload::SmLoad, space::Space, BucketId, BucketIter, BucketKind,
         },
         prelude::*,
     };
@@ -23,6 +26,7 @@ pub mod remap;
 pub mod select;
 pub mod simfilewrite;
 pub mod simultaneous;
+pub mod smload;
 pub mod space;
 
 #[derive(Clone, Default)]
@@ -459,5 +463,6 @@ make_concrete!(
     Rate,
     Space,
     OsuLoad,
+    SmLoad,
     SimfileWrite,
 );

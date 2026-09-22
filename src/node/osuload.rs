@@ -9,6 +9,11 @@ pub struct OsuLoad {
     pub input: String,
     /// Whether to attempt to automatically correct the path if it points to somewhere within an
     /// osu! installation.
+    ///
+    /// Default is `false` (was `true` in upstream osu2sm). When `false`, the
+    /// `input` path is used verbatim, regardless of whether it points to a
+    /// proper osu! installation layout. This decouples the loader from
+    /// requiring an osu! install.
     pub fix_input: bool,
     /// The offset to apply to osu! files, in milliseconds.
     pub offset: f64,
@@ -49,7 +54,7 @@ impl Default for OsuLoad {
     fn default() -> Self {
         Self {
             input: "".into(),
-            fix_input: true,
+            fix_input: false,
             offset: 0.,
             query_audio_len: true,
             gamemodes: {
@@ -148,8 +153,10 @@ impl Node for OsuLoad {
     fn prepare(&mut self) -> Result<()> {
         if self.input.is_empty() {
             eprintln!();
-            eprintln!("drag and drop your osu! song folder into this window, then press enter");
-            self.input = crate::read_path_from_stdin()?;
+            eprintln!(
+                "drag and drop your osu! song folder (or any folder of .osu files) into this window, then press enter"
+            );
+            self.input = crate::bin_shared::read_path_from_stdin()?;
         }
         if self.fix_input {
             debug!("autodetecting osu! installation");
@@ -619,7 +626,9 @@ impl ConvCtx<'_> {
                 },
                 artist_trans: bm.artist.clone(),
                 genre: String::new(),
-                credit: bm.creator.clone(),
+                // Don't blindly copy the osu! creator into `#CREDIT`; SM 5.1
+                // reference packs leave it empty unless explicitly set.
+                credit: String::new(),
                 banner: None,
                 background: Some(
                     if conf.video && !bm.video.is_empty() {

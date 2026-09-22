@@ -1,2 +1,5 @@
 /target
 /osu2sm*
+
+# Local scratch logs from cargo runs
+*.log

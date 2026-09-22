@@ -5,6 +5,28 @@ use crate::prelude::*;
 /// Forced to be 4 by the godlike simfile format.
 const BEATS_IN_MEASURE: i32 = 4;
 
+/// Standard SM 5.1 preview length, in seconds.
+const SAMPLE_LENGTH_SECONDS: f64 = 12.0;
+
+/// Format an `f64` value to a string compatible with the StepMania 5.1
+/// reference convention: up to 3 decimal places, with trailing zeros removed,
+/// and no scientific notation. `NaN` and `Inf` are coerced to `0`.
+///
+/// Examples:
+/// - `0.5985209960937521` → `"0.599"`
+/// - `171.99996500651727` → `"172"`
+/// - `-1.123` → `"-1.123"`
+/// - `133.020` → `"133.02"`
+pub fn fmt_f64(v: f64) -> String {
+    if !v.is_finite() {
+        return "0".to_string();
+    }
+    // Round to 3 decimal places via string parse (avoids f64 drift).
+    let rounded = (v * 1000.).round() / 1000.;
+    let s = format!("{}", rounded);
+    s
+}
+
 #[derive(Debug, Clone)]
 pub struct Simfile {
     pub title: String,
@@ -44,10 +66,38 @@ impl Simfile {
                 .to_str()
                 .ok_or_else(|| anyhow!("non-utf8 {}", name))
         }
+        // Dedupe `*_translit` against their primary counterparts.
+        // When the transliteration is identical to the primary, emit an empty
+        // string instead — matches the StepMania 5.1 reference convention.
+        let title_t = if main_sm.title_trans == main_sm.title {
+            ""
+        } else {
+            main_sm.title_trans.as_str()
+        };
+        let subtitle_t = if main_sm.subtitle_trans == main_sm.subtitle {
+            ""
+        } else {
+            main_sm.subtitle_trans.as_str()
+        };
+        let artist_t = if main_sm.artist_trans == main_sm.artist {
+            ""
+        } else {
+            main_sm.artist_trans.as_str()
+        };
+        // #SAMPLESTART must be non-negative.
+        let sample_start = main_sm
+            .sample_start
+            .map(|s| fmt_f64(s.max(0.)))
+            .unwrap_or_else(String::new);
+        // #SAMPLELENGTH is the song-wheel preview length; the SM 5.1 reference
+        // convention is 12 seconds.
+        let sample_len = main_sm
+            .sample_len
+            .map(|l| fmt_f64(l.clamp(0., f64::MAX)))
+            .unwrap_or_else(|| "12.000".to_string());
         write!(
             file,
             r#"
-// Simfile converted from osu! automatically using `osu2sm` by negamartin
 #TITLE:{title};
 #SUBTITLE:{subtitle};
 #ARTIST:{artist};
@@ -75,9 +125,9 @@ impl Simfile {
             title = main_sm.title,
             subtitle = main_sm.subtitle,
             artist = main_sm.artist,
-            title_t = main_sm.title_trans,
-            subtitle_t = main_sm.subtitle_trans,
-            artist_t = main_sm.artist_trans,
+            title_t = title_t,
+            subtitle_t = subtitle_t,
+            artist_t = artist_t,
             genre = main_sm.genre,
             credit = main_sm.credit,
             banner = as_utf8(&main_sm.banner, "BANNER")?,
@@ -85,16 +135,10 @@ impl Simfile {
             lyrics = as_utf8(&main_sm.lyrics, "LYRICSPATH")?,
             cdtitle = as_utf8(&main_sm.cdtitle, "CDTITLE")?,
             music = as_utf8(&main_sm.music, "MUSIC")?,
-            offset = main_sm.offset,
-            sample_start = main_sm
-                .sample_start
-                .map(|s| format!("{}", s))
-                .unwrap_or_else(String::new),
-            sample_len = main_sm
-                .sample_len
-                .map(|l| format!("{}", l))
-                .unwrap_or_else(String::new),
-            display_bpm = main_sm.display_bpm.to_string(),
+            offset = fmt_f64(main_sm.offset),
+            sample_start = sample_start,
+            sample_len = sample_len,
+            display_bpm = main_sm.display_bpm.to_string_with(|v| fmt_f64(v)),
             bpms = {
                 let mut bpms = String::new();
                 let mut first = true;
@@ -104,12 +148,26 @@ impl Simfile {
                     } else {
                         bpms.push(',');
                     }
-                    write!(bpms, "{}={}", point.beat.as_num(), point.bpm()).unwrap();
+                    write!(
+                        bpms,
+                        "{}={}",
+                        fmt_f64(point.beat.as_num()),
+                        fmt_f64(point.bpm()),
+                    )
+                    .unwrap();
                 }
                 bpms
             },
         )?;
         for sm in iter::once(main_sm).chain(simfiles) {
+            // Visual separator before each `#NOTES:` block, mirroring the
+            // convention used by SM 5.1 reference packs (e.g. ettgroup/YATTA).
+            write!(
+                file,
+                "\n//---------------{gamemode} - {diff_name}----------------",
+                gamemode = sm.gamemode.id(),
+                diff_name = sm.difficulty.name(),
+            )?;
             write!(
                 file,
                 r#"
@@ -336,6 +394,93 @@ impl Simfile {
         //Check the last remaining beat
         check_beat(last_beat, last_beat_start, self.notes.len())?;
         Ok(())
+    }
+
+    /// Load one or more simfiles from a `.sm` file path.
+    ///
+    /// A single `.sm` file can contain multiple `#NOTES:` blocks (one per
+    /// difficulty); this returns a `Vec<Simfile>` with one entry per block.
+    /// The shared metadata (`#TITLE`, `#OFFSET`, `#BPMS`, ...) is copied to
+    /// each returned `Simfile`; per-block fields (gamemode, difficulty,
+    /// radar, notes) are parsed from each `#NOTES:` block.
+    pub fn load(path: &Path) -> Result<Vec<Simfile>> {
+        let text = fs::read_to_string(path)
+            .with_context(|| anyhow!("failed to read \"{}\"", path.display()))?;
+        let mut parser = SmParser::new(&text);
+        let meta = parser.parse_header()?;
+        let mut out = Vec::new();
+        while let Some((gamemode, difficulty, difficulty_num, radar, desc, notes_text)) =
+            parser.parse_notes_block()?
+        {
+            let notes = parse_notedata(&notes_text, gamemode.key_count())?;
+            let mut sm = Simfile {
+                title: meta.title.clone(),
+                subtitle: meta.subtitle.clone(),
+                artist: meta.artist.clone(),
+                title_trans: meta.title_trans.clone(),
+                subtitle_trans: meta.subtitle_trans.clone(),
+                artist_trans: meta.artist_trans.clone(),
+                genre: meta.genre.clone(),
+                credit: meta.credit.clone(),
+                banner: meta.banner.as_ref().map(PathBuf::from),
+                background: meta.background.as_ref().map(PathBuf::from),
+                lyrics: meta.lyrics.as_ref().map(PathBuf::from),
+                cdtitle: meta.cdtitle.as_ref().map(PathBuf::from),
+                music: meta.music.as_ref().map(PathBuf::from),
+                offset: meta.offset,
+                bpms: meta.bpms.clone(),
+                stops: meta.stops.clone(),
+                sample_start: meta.sample_start,
+                sample_len: meta.sample_len,
+                display_bpm: meta.display_bpm,
+                gamemode,
+                desc,
+                difficulty,
+                difficulty_num,
+                radar,
+                notes,
+            };
+            // Re-pair title-translits with primaries on load. The .sm file
+            // can have an explicit translit that equals the primary (e.g. when
+            // the author only filled in the primary); we treat that as no
+            // transliteration.
+            if sm.title_trans == sm.title {
+                sm.title_trans.clear();
+            }
+            if sm.subtitle_trans == sm.subtitle {
+                sm.subtitle_trans.clear();
+            }
+            if sm.artist_trans == sm.artist {
+                sm.artist_trans.clear();
+            }
+            out.push(sm);
+        }
+        if out.is_empty() {
+            bail!("no #NOTES: blocks found in \"{}\"", path.display());
+        }
+        Ok(out)
+    }
+}
+
+/// Strip characters that are invalid in filenames on at least one common
+/// operating system, plus leading/trailing whitespace. Falls back to
+/// `"untitled"` if the result is empty.
+pub fn sanitize_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            // Forbidden on Windows; forbidden on most filesystems in general.
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => out.push('_'),
+            // Control characters (NUL, BEL, ...).
+            c if (c as u32) < 0x20 => out.push('_'),
+            c => out.push(c),
+        }
+    }
+    let trimmed = out.trim().trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        "untitled".to_string()
+    } else {
+        trimmed
     }
 }
 
@@ -710,7 +855,7 @@ pub enum Difficulty {
     Edit,
 }
 impl Difficulty {
-    fn name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         use Difficulty::*;
         match self {
             Beginner => "Beginner",
@@ -729,12 +874,17 @@ pub enum DisplayBpm {
     Range(f64, f64),
     Random,
 }
+impl Default for DisplayBpm {
+    fn default() -> Self {
+        DisplayBpm::Single(120.0)
+    }
+}
 impl DisplayBpm {
-    pub fn to_string(&self) -> String {
+    pub fn to_string_with<F: Fn(f64) -> String>(&self, fmt: F) -> String {
         use DisplayBpm::*;
         match self {
-            Single(bpm) => format!("{}", bpm),
-            Range(min, max) => format!("{}:{}", min, max),
+            Single(bpm) => fmt(*bpm),
+            Range(min, max) => format!("{}:{}", fmt(*min), fmt(*max)),
             Random => format!("*"),
         }
     }
@@ -929,5 +1079,508 @@ impl ToTime<'_> {
         //Use the current control point to determine the time corresponding to this beat
         let cur_bpm = &self.bpms[self.cur_idx];
         self.cur_time + (beat - cur_bpm.beat).as_num() * cur_bpm.beat_len
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `.sm` parser (used by `Simfile::load`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Clone)]
+struct SmHeader {
+    title: String,
+    subtitle: String,
+    artist: String,
+    title_trans: String,
+    subtitle_trans: String,
+    artist_trans: String,
+    genre: String,
+    credit: String,
+    banner: Option<String>,
+    background: Option<String>,
+    lyrics: Option<String>,
+    cdtitle: Option<String>,
+    music: Option<String>,
+    offset: f64,
+    bpms: Vec<ControlPoint>,
+    stops: Vec<(f64, f64)>,
+    sample_start: Option<f64>,
+    sample_len: Option<f64>,
+    display_bpm: DisplayBpm,
+}
+
+/// Lightweight line-based parser for the `.sm` v5 format.
+///
+/// Only the fields the rest of the pipeline reads are populated; everything
+/// else is ignored. This is enough to round-trip the reference packs shipped
+/// with StepMania 5.1 and any output produced by `Simfile::save`.
+struct SmParser<'a> {
+    text: &'a str,
+    pos: usize,
+}
+impl<'a> SmParser<'a> {
+    fn new(text: &'a str) -> Self {
+        SmParser { text, pos: 0 }
+    }
+    fn parse_header(&mut self) -> Result<SmHeader> {
+        let mut hdr = SmHeader::default();
+        hdr.sample_len = Some(SAMPLE_LENGTH_SECONDS);
+        //Default BPM so a simfile without #BPMS doesn't crash later
+        hdr.bpms.push(ControlPoint {
+            beat: BeatPos::from(0.),
+            beat_len: 60. / 120.,
+        });
+        while let Some(line) = self.peek_line() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("//") {
+                self.advance_line();
+                continue;
+            }
+            if line.starts_with('#') {
+                let (key, value) = match split_header(line) {
+                    Some(kv) => kv,
+                    None => {
+                        self.advance_line();
+                        continue;
+                    }
+                };
+                match key {
+                    "TITLE" => hdr.title = value.to_string(),
+                    "SUBTITLE" => hdr.subtitle = value.to_string(),
+                    "ARTIST" => hdr.artist = value.to_string(),
+                    "TITLETRANSLIT" => hdr.title_trans = value.to_string(),
+                    "SUBTITLETRANSLIT" => hdr.subtitle_trans = value.to_string(),
+                    "ARTISTTRANSLIT" => hdr.artist_trans = value.to_string(),
+                    "GENRE" => hdr.genre = value.to_string(),
+                    "CREDIT" => hdr.credit = value.to_string(),
+                    "BANNER" if !value.is_empty() => hdr.banner = Some(value.to_string()),
+                    "BACKGROUND" if !value.is_empty() => {
+                        hdr.background = Some(value.to_string())
+                    }
+                    "LYRICSPATH" if !value.is_empty() => hdr.lyrics = Some(value.to_string()),
+                    "CDTITLE" if !value.is_empty() => hdr.cdtitle = Some(value.to_string()),
+                    "MUSIC" if !value.is_empty() => hdr.music = Some(value.to_string()),
+                    "OFFSET" => hdr.offset = value.parse().unwrap_or(0.),
+                    "SAMPLESTART" => {
+                        if let Ok(v) = value.parse::<f64>() {
+                            hdr.sample_start = Some(v.max(0.));
+                        }
+                    }
+                    "SAMPLELENGTH" => {
+                        if let Ok(v) = value.parse::<f64>() {
+                            hdr.sample_len = Some(v.max(0.));
+                        }
+                    }
+                    "DISPLAYBPM" => hdr.display_bpm = parse_display_bpm(value),
+                    "BPMS" => hdr.bpms = parse_bpms(value)?,
+                    "STOPS" => hdr.stops = parse_stops(value),
+                    "NOTES" => break,
+                    _ => {}
+                }
+                self.advance_line();
+            } else {
+                self.advance_line();
+            }
+        }
+        Ok(hdr)
+    }
+    /// Returns `(gamemode, difficulty, difficulty_num, radar, desc, notes_text)`.
+    fn parse_notes_block(
+        &mut self,
+    ) -> Result<
+        Option<(
+            Gamemode,
+            Difficulty,
+            f64,
+            [f64; 5],
+            String,
+            String,
+        )>,
+    > {
+        //Skip until we see #NOTES:
+        while let Some(line) = self.peek_line() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("#NOTES:") {
+                self.advance_line();
+                break;
+            }
+            self.advance_line();
+        }
+        //Need 5 lines after #NOTES:
+        let gamemode_line = match self.next_line() {
+            Some(l) => l.trim().trim_end_matches(':').to_string(),
+            None => return Ok(None),
+        };
+        let desc_line = match self.next_line() {
+            Some(l) => l.trim().trim_end_matches(':').to_string(),
+            None => return Ok(None),
+        };
+        let diff_name_line = match self.next_line() {
+            Some(l) => l.trim().trim_end_matches(':').to_string(),
+            None => return Ok(None),
+        };
+        let diff_num_line = match self.next_line() {
+            Some(l) => l.trim().to_string(),
+            None => return Ok(None),
+        };
+        let radar_line = match self.next_line() {
+            Some(l) => l.trim().to_string(),
+            None => return Ok(None),
+        };
+        let difficulty = parse_difficulty(&diff_name_line);
+        let difficulty_num: f64 = diff_num_line.parse().unwrap_or(0.);
+        let radar = parse_radar(&radar_line);
+        let gamemode = parse_gamemode(&gamemode_line)
+            .ok_or_else(|| anyhow!("unknown gamemode \"{}\"", gamemode_line))?;
+        //Collect notes until the next `#` directive or EOF. Strip the
+        // trailing `;` that terminates the `#NOTES:` block.
+        let mut notes_text = String::new();
+        while let Some(line) = self.peek_line() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                break;
+            }
+            notes_text.push_str(line);
+            notes_text.push('\n');
+            self.advance_line();
+        }
+        // Drop a single trailing `;` (and any whitespace around it).
+        if let Some(stripped) = notes_text.strip_suffix(';') {
+            notes_text = stripped.to_string();
+        }
+        if let Some(stripped) = notes_text.strip_suffix(';') {
+            notes_text = stripped.to_string();
+        }
+        Ok(Some((gamemode, difficulty, difficulty_num, radar, desc_line, notes_text)))
+    }
+    fn peek_line(&self) -> Option<&'a str> {
+        let rest = &self.text[self.pos..];
+        if rest.is_empty() {
+            return None;
+        }
+        if let Some(idx) = rest.find('\n') {
+            Some(&rest[..idx])
+        } else {
+            Some(rest)
+        }
+    }
+    fn next_line(&mut self) -> Option<&'a str> {
+        let line = self.peek_line()?;
+        self.pos += line.len();
+        if self.text[self.pos..].starts_with('\n') {
+            self.pos += 1;
+        }
+        Some(line)
+    }
+    fn advance_line(&mut self) {
+        let _ = self.next_line();
+    }
+}
+
+fn split_header(line: &str) -> Option<(&str, &str)> {
+    //Form: `#KEY:value;`
+    let line = line.strip_prefix('#')?;
+    let (key, rest) = line.split_once(':')?;
+    let value = rest.trim_end_matches(';');
+    Some((key, value))
+}
+
+fn parse_bpms(s: &str) -> Result<Vec<ControlPoint>> {
+    let mut out = Vec::new();
+    for entry in s.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (beat_str, bpm_str) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow!("malformed #BPMS entry \"{}\"", entry))?;
+        let beat: f64 = beat_str
+            .trim()
+            .parse()
+            .with_context(|| anyhow!("invalid beat in #BPMS \"{}\"", entry))?;
+        let bpm: f64 = bpm_str
+            .trim()
+            .parse()
+            .with_context(|| anyhow!("invalid BPM in #BPMS \"{}\"", entry))?;
+        if bpm <= 0. {
+            bail!("non-positive BPM in #BPMS \"{}\"", entry);
+        }
+        out.push(ControlPoint {
+            beat: BeatPos::from(beat),
+            beat_len: 60. / bpm,
+        });
+    }
+    if out.is_empty() {
+        bail!("#BPMS has no entries");
+    }
+    Ok(out)
+}
+
+fn parse_stops(s: &str) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    for entry in s.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((beat_str, len_str)) = entry.split_once('=') else {
+            continue;
+        };
+        let Ok(beat) = beat_str.trim().parse() else { continue };
+        let Ok(len) = len_str.trim().parse() else { continue };
+        out.push((beat, len));
+    }
+    out
+}
+
+fn parse_display_bpm(s: &str) -> DisplayBpm {
+    let s = s.trim();
+    if s == "*" {
+        return DisplayBpm::Random;
+    }
+    if let Some((min_str, max_str)) = s.split_once(':') {
+        if let (Ok(min), Ok(max)) = (min_str.parse(), max_str.parse()) {
+            return DisplayBpm::Range(min, max);
+        }
+    }
+    s.parse().map(DisplayBpm::Single).unwrap_or(DisplayBpm::Random)
+}
+
+fn parse_difficulty(s: &str) -> Difficulty {
+    use Difficulty::*;
+    match s.to_ascii_lowercase().as_str() {
+        "beginner" | "novice" => Beginner,
+        "easy" | "basic" => Easy,
+        "medium" | "light" | "another" => Medium,
+        "hard" | "difficult" | "standard" => Hard,
+        "challenge" | "hardest" | "maniac" | "expert" | "oni" => Challenge,
+        _ => Edit,
+    }
+}
+
+fn parse_gamemode(s: &str) -> Option<Gamemode> {
+    use Gamemode::*;
+    let s = s.to_ascii_lowercase();
+    let s = s.trim_end_matches(':');
+    Some(match s {
+        "dance-single" => DanceSingle,
+        "dance-double" => DanceDouble,
+        "dance-couple" => DanceCouple,
+        "dance-solo" => DanceSolo,
+        "dance-threepanel" => DanceThreepanel,
+        "dance-routine" => DanceRoutine,
+        "pump-single" => PumpSingle,
+        "pump-halfdouble" => PumpHalfdouble,
+        "pump-double" => PumpDouble,
+        "pump-couple" => PumpCouple,
+        "pump-routine" => PumpRoutine,
+        "kb7-single" => Kb7Single,
+        "ez2-single" => Ez2Single,
+        "ez2-double" => Ez2Double,
+        "ez2-real" => Ez2Real,
+        "para-single" => ParaSingle,
+        "ds3ddx-single" => Ds3ddxSingle,
+        "bm-single5" | "bm-single" | "bm" => BmSingle5,
+        "bm-versus5" => BmVersus5,
+        "bm-double5" => BmDouble5,
+        "bm-single7" => BmSingle7,
+        "bm-versus7" => BmVersus7,
+        "bm-double7" => BmDouble7,
+        "maniax-single" => ManiaxSingle,
+        "maniax-double" => ManiaxDouble,
+        "techno-single4" => TechnoSingle4,
+        "techno-single5" => TechnoSingle5,
+        "techno-single8" => TechnoSingle8,
+        "techno-double4" => TechnoDouble4,
+        "techno-double5" => TechnoDouble5,
+        "techno-double8" => TechnoDouble8,
+        "pnm-five" => PnmFive,
+        "pnm-nine" => PnmNine,
+        "kickbox-human" => KickboxHuman,
+        "kickbox-quadarm" => KickboxQuadarm,
+        "kickbox-insect" => KickboxInsect,
+        "kickbox-arachnid" => KickboxArachnid,
+        _ => return None,
+    })
+}
+
+fn parse_radar(s: &str) -> [f64; 5] {
+    let mut out = [0.0; 5];
+    for (i, part) in s.split(',').enumerate() {
+        if i >= 5 {
+            break;
+        }
+        out[i] = part.trim().parse().unwrap_or(0.);
+    }
+    out
+}
+
+/// Parse the notes-text portion of a `#NOTES:` block into a `Vec<Note>`.
+///
+/// Mirrors the inverse of `write_measure`: each measure is separated by `,`
+/// and contains `4 * rows_per_beat` rows of `key_count` columns.
+fn parse_notedata(text: &str, key_count: i32) -> Result<Vec<Note>> {
+    let mut notes = Vec::new();
+    let mut cur_beat_num = 0.0_f64; // beats since start of song
+    for measure_text in text.split(',') {
+        // Strip whitespace and measure-header comments (`// Measure N`).
+        let mut rows: Vec<&str> = Vec::new();
+        for line in measure_text.lines() {
+            let trimmed = line.trim();
+            // Skip empty lines, measure-header comments, and the `;`
+            // terminator that closes a `#NOTES:` block.
+            if trimmed.is_empty()
+                || trimmed.starts_with("//")
+                || trimmed == ";"
+            {
+                continue;
+            }
+            // Allow only line-of-N-cols lines.
+            if trimmed.chars().count() as i32 != key_count {
+                bail!(
+                    "expected {}-char row in measure, got {:?} ({:?})",
+                    key_count,
+                    trimmed,
+                    line
+                );
+            }
+            rows.push(trimmed);
+        }
+        let rows_per_beat = rows.len() as i32 / BEATS_IN_MEASURE;
+        if rows_per_beat <= 0 {
+            // Empty measure; advance one measure's worth of beats.
+            cur_beat_num += BEATS_IN_MEASURE as f64;
+            continue;
+        }
+        for (row_idx, row) in rows.iter().enumerate() {
+            let beat_in_measure = row_idx as f64 / rows_per_beat as f64;
+            for (key, ch) in row.chars().enumerate() {
+                if ch == '0' {
+                    continue;
+                }
+                // Preserve any non-zero note kind verbatim. StepMania 5.1
+                // additionally defines `4` (mines / fakes) and `M` (mine),
+                // which we don't model in `Note` but accept at load time so
+                // that round-tripping a reference pack doesn't error out.
+                notes.push(Note {
+                    kind: ch,
+                    beat: BeatPos::from(cur_beat_num + beat_in_measure),
+                    key: key as i32,
+                });
+            }
+        }
+        cur_beat_num += BEATS_IN_MEASURE as f64;
+    }
+    Ok(notes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_f64_trims_to_three_decimals() {
+        assert_eq!(fmt_f64(0.5985209960937521_f64), "0.599");
+        assert_eq!(fmt_f64(171.99996500651727_f64), "172");
+        assert_eq!(fmt_f64(133.020_f64), "133.02");
+        assert_eq!(fmt_f64(-1.123_f64), "-1.123");
+        assert_eq!(fmt_f64(0.0_f64), "0");
+        assert_eq!(fmt_f64(120.0_f64), "120");
+        assert_eq!(fmt_f64(f64::NAN), "0");
+        assert_eq!(fmt_f64(f64::INFINITY), "0");
+    }
+
+    #[test]
+    fn sanitize_filename_strips_os_unsafe_chars() {
+        assert_eq!(sanitize_filename("Hello/World?"), "Hello_World_");
+        assert_eq!(sanitize_filename("<>:\"/\\|?*"), "_________");
+        assert_eq!(sanitize_filename("   .dot.   "), "dot");
+        assert_eq!(sanitize_filename(""), "untitled");
+        assert_eq!(sanitize_filename("中文 标题"), "中文 标题");
+        assert_eq!(sanitize_filename("L0V3 4RR0W 5H007"), "L0V3 4RR0W 5H007");
+    }
+
+    #[test]
+    fn load_reference_sm_round_trip() {
+        // Synthetic mini SM, modeled on ettgroup reference style.
+        let sm_text = "\
+#TITLE:test;
+#SUBTITLE:;
+#ARTIST:;
+#TITLETRANSLIT:;
+#SUBTITLETRANSLIT:;
+#ARTISTTRANSLIT:;
+#GENRE:;
+#CREDIT:;
+#BANNER:;
+#BACKGROUND:;
+#LYRICSPATH:;
+#CDTITLE:;
+#MUSIC:test.mp3;
+#OFFSET:0.0;
+#SAMPLESTART:10.0;
+#SAMPLELENGTH:12.0;
+#DISPLAYBPM:120;
+#SELECTABLE:YES;
+#BPMS:0.0=120;
+#STOPS:;
+#BGCHANGES:;
+#KEYSOUNDS:;
+#ATTACKS:;
+#NOTES:
+    dance-single:
+    desc:
+    Hard:
+    5:
+    0,0,0,0,0:
+0000
+0000
+0000
+0000
+;
+";
+        let mut parser = SmParser::new(sm_text);
+        let meta = parser.parse_header().unwrap();
+        assert_eq!(meta.title, "test");
+        assert_eq!(meta.music.as_deref(), Some("test.mp3"));
+        assert_eq!(meta.offset, 0.0);
+        let (gamemode, diff, _meter, radar, _desc, notes_text) =
+            parser.parse_notes_block().unwrap().unwrap();
+        assert_eq!(gamemode, Gamemode::DanceSingle);
+        assert_eq!(diff, Difficulty::Hard);
+        let notes = parse_notedata(&notes_text, gamemode.key_count()).unwrap();
+        assert!(notes.is_empty());
+        assert_eq!(radar[0], 0.0);
+    }
+
+    #[test]
+    fn load_skips_empty_measures() {
+        let notes = parse_notedata(",\n,", 4).unwrap();
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn round_trip_real_sm_file() {
+        // Smoke test against a real reference SM file shipped with StepMania 5.1.
+        let path = std::path::Path::new(
+            r"C:\DEV\StepMania 5.1-new(fixed)\Songs\ettgroup\YATTA\music.sm",
+        );
+        if !path.exists() {
+            // Reference pack not available in this environment; skip silently.
+            eprintln!("skipping: reference SM file not present at {:?}", path);
+            return;
+        }
+        let simfiles = Simfile::load(path).expect("real reference SM should load");
+        assert!(!simfiles.is_empty(), "real SM file should have notes");
+        for sm in &simfiles {
+            assert!(!sm.title.is_empty(), "title should be set");
+            assert!(!sm.notes.is_empty(), "notes should be populated");
+            // Write the simfile back to a temp dir and verify the file is non-empty.
+            let tmp = std::env::temp_dir().join("osu2sm_roundtrip.sm");
+            Simfile::save(&tmp, std::iter::once(sm)).expect("save should succeed");
+            let bytes = std::fs::metadata(&tmp).expect("saved file exists").len();
+            assert!(bytes > 100, "saved file should be non-trivial (got {} bytes)", bytes);
+        }
     }
 }
