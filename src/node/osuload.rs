@@ -254,6 +254,15 @@ fn scan_folder(
                     }
                 }
                 if !dir.is_empty() {
+                    // Co-operative cancellation for the GUI. Checked once per
+                    // beatmapset, so stopping is always immediate from the
+                    // user's point of view but never leaves a half-written
+                    // simfile behind.
+                    if crate::progress::is_cancelled() {
+                        info!("  cancelled by user, stopping scan");
+                        return Ok(());
+                    }
+                    crate::progress::add_total();
                     match process_beatmapset(conf, store, entry.path(), &dir[..], on_bmset) {
                         Ok(()) => {}
                         Err(e) => {
@@ -264,6 +273,7 @@ fn scan_folder(
                             );
                         }
                     }
+                    crate::progress::finish_one();
                 }
             }
         } else {

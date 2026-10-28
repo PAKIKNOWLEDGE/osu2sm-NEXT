@@ -11,7 +11,7 @@ The conversion core (`rekey` / `remap` / `rate` / `select` / `align` / `space` /
 - **Decoupled output.** `SimfileWrite::in_place` defaults to `false`, and the auto-detect of a StepMania install is opt-in. You can write to any folder.
 - **Standard StepMania layout.** Simfiles are written as `<group>/<song>/<title>.sm`, matching the convention used by the reference packs under `StepMania 5.1/Songs/<group>/<song>/<files>`. A `FlatInGroup` layout is available for quick flat dumps.
 - **SM 5.1 field cleanup.** The output drops the upstream-osu2sm attribution comment, normalises `f64` precision (3 decimals, trailing zeros trimmed), clamps `#SAMPLESTART` to non-negative, fixes `#SAMPLELENGTH` to a 12-second preview instead of the full song length, and empties the `*_TRANSLIT` and `CREDIT` fields by default.
-- **Graphical front-end.** `cargo build --features gui` produces `osu2sm-gui`, an `eframe` window with live status, dry-run preview, and config load/save.
+- **Graphical front-end.** `cargo build --features gui` produces `osu2sm-gui`. It is deliberately narrow: pick the osu! song folder, pick a StepMania song group, press **转换**. The pipeline is pinned to 4K mania → `dance-single` (`osu2sm::pipeline_4k`); no RON editing.
 - **`dry_run` mode.** Flip the toggle and the writer logs every file it *would* write without touching the filesystem.
 
 # Getting started
@@ -34,11 +34,19 @@ cargo build --release --features gui
 ./target/release/osu2sm-gui
 ```
 
-The GUI shows the current RON config inline. Edit it, click **Reload from text**, then **▶ Run** (or **Preview (dry-run)**).
+It does exactly one thing: osu! **4K mania** → StepMania `dance-single`.
+
+1. Pick the osu! song folder (e.g. `D:\osu!\Songs`) and the target song group (e.g. `D:\StepMania 5.1\Songs\MyPack`). Both rows accept drag-and-drop, and the input folder is scanned up front so you can see how many charts are 4K before converting.
+2. Optionally tick **试运行** (resolve and log every path, write nothing), **跳过已存在** (leave an existing `.sm` untouched) or **复制音频/背景** (off = write `.sm` only).
+3. Press **▶ 转换**.
+
+The status bar counts beatmapsets; conversion runs on a worker thread and can be cancelled between beatmapsets. Charts that are not 4K mania are skipped and reported in the log. On Windows the binary is linked with the `windows` subsystem, so no console window ever appears (debug or release); feedback goes to the log panel at the bottom of the window instead, panics are appended to `%LOCALAPPDATA%\osu2sm\crash.log` and shown in a dialog, and a failed start is reported in a dialog too. Paths and toggles are remembered in `%LOCALAPPDATA%\osu2sm\gui-state.txt`.
+
+The GUI never reads or writes a RON config, does not expose `standard`, `Remap`, `Align`, `Space`, `SmLoad`, `in_place` or `cleanup`, and always writes the standard `<group>/<song>/<title>.sm` layout. For anything outside that shape, use the CLI.
 
 # Configuration
 
-The config is a RON document. See `examples/default.config.txt` for the full annotated example. The two source options are mutually exclusive at the top of the pipeline:
+Config files are CLI-only — the GUI builds its `Opts` in code. The config is a RON document. See `examples/default.config.txt` for the full annotated example. The two source options are mutually exclusive at the top of the pipeline:
 
 ```ron
 // Either:

@@ -34,6 +34,12 @@ pub struct SimfileWrite {
     /// If `true`, compute the output paths and log them, but do not write
     /// any files. Used by the GUI's "Preview" button.
     pub dry_run: bool,
+    /// Whether to overwrite an existing simfile at the target path.
+    ///
+    /// `true` (the default) keeps the historical behaviour. `false` makes
+    /// re-runs incremental: a song whose `.sm` already exists is left alone.
+    /// This is what the GUI's "跳过已存在" checkbox sets.
+    pub overwrite: bool,
     /// The path to the output directory (a StepMania song group, or a flat
     /// folder when `layout = FlatInGroup`).
     pub output: String,
@@ -71,6 +77,7 @@ impl Default for SimfileWrite {
             cleanup: false,
             layout: OutputLayout::PerSongFolder,
             dry_run: false,
+            overwrite: true,
         }
     }
 }
@@ -364,12 +371,22 @@ fn write_sm(
         }
         return Ok(());
     }
+    //Leave an existing simfile alone when the user asked for an incremental run
+    if !conf.overwrite && out_path.exists() {
+        info!(
+            "  skipping existing simfile \"{}\" (overwrite is off)",
+            out_path.display()
+        );
+        return Ok(());
+    }
     //Write simfile
     debug!("  writing simfile to \"{}\"", out_path.display());
     Simfile::save(&out_path, sms.iter().map(|sm| &**sm))
         .with_context(|| anyhow!("write simfile to \"{}\"", out_path.display()))?;
+    crate::progress::add_file();
     //Copy over dependencies (backgrounds, audio, etc...)
-    if !in_place_enabled(conf) {
+    //An empty `copy` list means "do not copy anything".
+    if !in_place_enabled(conf) && !conf.copy.is_empty() {
         for sm in sms.iter() {
             for dep_name in sm.file_deps() {
                 if already_copied.contains(dep_name) {

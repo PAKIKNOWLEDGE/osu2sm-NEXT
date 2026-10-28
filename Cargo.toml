@@ -20,12 +20,11 @@ natord = "1"
 # GUI dependencies (only pulled in by the `osu2sm-gui` binary).
 eframe = { version = "0.27", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = { version = "0.27", optional = true }
-egui_extras = { version = "0.27", optional = true, features = ["all_loaders"] }
 rfd = { version = "0.14", optional = true, default-features = false, features = ["xdg-portal", "tokio"] }
 
 [features]
 default = []
-gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
+gui = ["dep:eframe", "dep:egui", "dep:rfd"]
 
 [[bin]]
 name = "osu2sm"

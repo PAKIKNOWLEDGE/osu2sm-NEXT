@@ -47,6 +47,28 @@
   `//---------------<gamemode> - <diff>----------------` visual separator,
   matching the convention in the reference packs.
 
+## GUI
+
+- `osu2sm-gui` is now a single-purpose front-end: osu! 4K mania →
+  `dance-single`. The pipeline is built in code by
+  `osu2sm::pipeline_4k`, so the window has no RON editor and no access to
+  `standard`, `Remap`, `Align`, `Space`, `SmLoad`, `in_place` or
+  `cleanup`.
+- On Windows the binary is linked with the `windows` subsystem in debug and
+  release alike, so no console window ever appears on launch. All feedback
+  goes to the in-window log panel; panics are appended to
+  `%LOCALAPPDATA%\osu2sm\crash.log` and shown in a dialog, and a failed start
+  is reported in a dialog as well.
+- The input folder is scanned before converting (song count, chart count,
+  4K count, skipped count). Conversion runs on a worker thread with a
+  progress bar and a cancel button that stops between beatmapsets, and the
+  window state (paths + toggles) is persisted to
+  `%LOCALAPPDATA%\osu2sm\gui-state.txt`.
+- New `SimfileWrite::overwrite` (default `true`). The "跳过已存在" checkbox
+  sets it to `false`, making re-runs incremental.
+- New `osu2sm::progress` module: a process-global sink that is a no-op
+  unless a `Progress` is installed, so the CLI is unaffected.
+
 ## Architecture
 
 - The crate is now a library (`osu2sm`) with two binaries: `osu2sm` (CLI)
