@@ -16,7 +16,7 @@ The conversion core (`rekey` / `remap` / `rate` / `select` / `align` / `space` /
 
 # Getting started
 
-There are two binaries.
+There are two binaries. Windows builds of both are attached to [the latest release](https://github.com/PAKIKNOWLEDGE/osu2sm-NEXT/releases/latest); the rest of this section builds from source.
 
 ## CLI
 

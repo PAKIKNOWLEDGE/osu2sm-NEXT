@@ -1,6 +1,6 @@
 [package]
 name = "osu2sm"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["negamartin <martin.andrighetti@gmail.com>", "PAKIKNOWLEDGE"]
 edition = "2018"
 
